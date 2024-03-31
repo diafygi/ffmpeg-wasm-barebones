@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <link rel="icon" href="data:;base64,iVBORw0KGgo="><!-- disable favicon request -->
+    <title>ffmpeg.wasm barebones demo</title>
+    <script src="ffmpegWasmBarebones.js"></script>
+  </head>
+  <body>
+    <h3>ffmpeg.wasm barebones demo</h3>
+    <p>
+        This is a demo for
+        <a href="https://github.com/diafygi/ffmpeg-wasm-barebones">https://github.com/diafygi/ffmpeg-wasm-barebones</a>
+    </p>
+    <form>
+        Command:<br>
+        <textarea id="args" style="width:40em;height:10em;">["-i", "%INPUTFILE%", "%OUTPUTFILE%"]</textarea><br><br>
+        Input file: <input id="infile" type="file">
+        (<a href="Big_Buck_Bunny_180_10s.webm" id="load-example-vid">load example webm</a>)<br><br>
+        Output file: <input id="outfile" value="output.gif"> <input id="outtype" value="image/gif"><br><br>
+        <input type="submit" value="Submit">
+    </form>
+    <div style="margin-top:1em;">
+        Result: <span id="progress"></span> | <span id="log"></span><br>
+        <hr>
+        <div id="result"></div>
+        <hr>
+    </div>
+    <script>
+        // downloaded from https://unpkg.com/browse/@ffmpeg/core@0.12.6/dist/umd/
+        const FFMPEG_CORE_URL = document.location.origin + document.location.pathname + "/ffmpeg-core/ffmpeg-core.js";
+        const FFMPEG_WASM_URL = document.location.origin + document.location.pathname + "/ffmpeg-core/ffmpeg-core.wasm";
+
+        // trigger ffmpeg to process some inputs
+        let ffmpeg = undefined;
+        document.querySelector('form').addEventListener('submit', async (e) => {
+            e.preventDefault();
+
+            // reset results
+            document.querySelector("#result").innerHTML = "";
+            document.querySelector("#progress").innerHTML = "";
+            document.querySelector("#log").innerHTML = "";
+
+            // read inputs
+            const inFile = exampleVidFile || document.querySelector('#infile').files[0];
+            const inFileName = inFile.name;
+            const inFileArr = await (new Promise((rslv) => {
+                const r = new FileReader();
+                r.onload = () => rslv(new Uint8Array(r.result));
+                r.readAsArrayBuffer(inFile);
+            }));
+            const outFileName =  document.querySelector('#outfile').value;
+            const outFileType =  document.querySelector('#outtype').value;
+
+            // convert ffmpeg command into full arguments
+            let execArgs = document.querySelector('#args').value;
+            execArgs = execArgs.replace("%INPUTFILE%", inFileName);
+            execArgs = execArgs.replace("%OUTPUTFILE%", outFileName);
+            execArgs = JSON.parse(execArgs);
+
+            // load ffmpeg
+            if (!ffmpeg) {
+                document.querySelector("#progress").textContent = "Loading ffmpeg...";
+                ffmpegConfig = {
+                    onLog: (l) => {
+                        console.log("log", l);
+                        document.querySelector("#log").textContent = `[${l.type}]: ${l.message}`;
+                    },
+                    onProgress: (p) => {
+                        console.log("progress", p);
+                        document.querySelector("#progress").textContent = `progress=${p.progress}, time=${p.time}`;
+                    },
+                }
+                ffmpeg = new FFmpegWasmBarebones(ffmpegConfig);
+                await ffmpeg.cmd("LOAD", {
+                    coreURL: FFMPEG_CORE_URL,
+                    wasmURL: FFMPEG_WASM_URL,
+                });
+                document.querySelector("#progress").textContent = "Loaded ffmpeg!";
+            }
+
+            // perform the action
+            await ffmpeg.cmd("WRITE_FILE", { path: inFileName, data: inFileArr}, [inFileArr.buffer]);
+            await ffmpeg.cmd("EXEC", { args: execArgs });
+            const data = await ffmpeg.cmd("READ_FILE", { path: outFileName });
+            await ffmpeg.cmd("DELETE_FILE", { path: outFileName });
+
+            // render result
+            const dataUrl = URL.createObjectURL(new Blob([data.buffer], { type: outFileType }));
+
+            const dl = document.createElement("a");
+            dl.href = dataUrl;
+            dl.textContent = "[download]";
+            dl.download = outFileName;
+            document.querySelector("#result").appendChild(dl);
+
+            document.querySelector("#result").appendChild(document.createElement("br"));
+
+            if (outFileType === "image/gif") {
+                const img = document.createElement("img");
+                img.src = dataUrl;
+                document.querySelector("#result").appendChild(img);
+            }
+            else {
+                const vid = document.createElement("video");
+                vid.src = dataUrl;
+                vid.setAttribute("controls", null);
+                document.querySelector("#result").appendChild(vid);
+            }
+        });
+
+        // don't require the user to provide a video file
+        let exampleVidFile = undefined;
+        document.querySelector('#load-example-vid').addEventListener('click', async (e) => {
+            e.preventDefault();
+            document.querySelector('#load-example-vid').textContent = "loading Big_Buck_Bunny_180_10s.webm...";
+            const fileBlob = await (await fetch("Big_Buck_Bunny_180_10s.webm")).blob();
+            exampleVidFile = new File([fileBlob], "Big_Buck_Bunny_180_10s.webm");
+            document.querySelector('#load-example-vid').textContent = "loaded Big_Buck_Bunny_180_10s.webm!";
+        }, { once: true });
+    </script>
+  </body>
+</html>
