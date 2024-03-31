@@ -2,7 +2,7 @@
 
 This is a minimal wrapper around `ffmpeg-core.wasm` from https://github.com/ffmpegwasm/ffmpeg.wasm
 
-Demo: https://diafygi.github.io/ffmpeg.wasm-barebones/
+Demo: https://diafygi.github.io/ffmpeg-wasm-barebones/
 
 ## Why I did this
 
