@@ -1,106 +1,94 @@
-// This is a stripped down version of ffmpeg.js and ffmpeg.worker.js
-// from https://unpkg.com/browse/@ffmpeg/ffmpeg@0.12.6/dist/umd/
+// This is a barebones wrapper around the ffmpeg-core wasm library from https://github.com/ffmpegwasm/ffmpeg.wasm
+// (so that you don't have to use their ffmpeg.js SDK, and can just use ffmpeg-core.js directly)
 
-// Copyright Daniel Roesler | Released under MIT License
+// Copyright Daniel Roesler | Released under MIT License | https://github.com/diafygi/ffmpeg-wasm-barebones
 
-function FFmpegWasmBarebones(config) {
+async function loadFFmpegCoreAPI(config) {
+
+    // config defaults
     config = config || {};
+    config.onLog = config.onLog ? config.onLog : (l) => { console.log("log", l); };
+    config.onProgress = config.onProgress ? config.onProgress : (p) => { console.log("progress", p); };
+    config.coreURL = config.coreURL || "https://unpkg.com/@ffmpeg/core@latest/dist/umd/ffmpeg-core.js";
+    config.wasmURL = config.wasmURL || "https://unpkg.com/@ffmpeg/core@latest/dist/umd/ffmpeg-core.wasm";
+    config.workerURL = config.workerURL || undefined;
 
+    // worker code
     const workerJS = `
     let ffmpegCore;
     self.onmessage = async (event) => {
-        const [msgId, cmd, payload] = event.data;
+        let [msgId, cmd, args] = event.data;
         let result = null;
         try {
-            switch (cmd) {
-                case "LOAD":
-                    importScripts(payload.coreURL);
-                    const coreFrag = btoa(JSON.stringify({ wasmURL: payload.wasmURL, workerURL: payload.workerURL}));
-                    ffmpegCore = await self.createFFmpegCore({ mainScriptUrlOrBlob: payload.coreURL + "#" + coreFrag });
-                    ffmpegCore.setLogger((logData) => { self.postMessage([undefined, "LOG", logData]); });
-                    ffmpegCore.setProgress((progData) => { self.postMessage([undefined, "PROGRESS", progData]); });
-                    break;
-                case "EXEC":
-                    ffmpegCore.setTimeout(payload.timeout !== undefined ? payload.timeout : -1);
-                    ffmpegCore.exec(...payload.args);
-                    result = ffmpegCore.ret;
-                    ffmpegCore.reset();
-                    break;
-                case "WRITE_FILE":
-                    ffmpegCore.FS.writeFile(payload.path, payload.data);
-                    break;
-                case "READ_FILE":
-                    result = ffmpegCore.FS.readFile(payload.path, { encoding: (payload.encoding || "binary") });
-                    break;
-                case "DELETE_FILE":
-                    ffmpegCore.FS.unlink(payload.path);
-                    break;
-                case "RENAME":
-                    ffmpegCore.FS.rename(payload.oldPath, payload.newPath);
-                    break;
-                case "CREATE_DIR":
-                    ffmpegCore.FS.mkdir(payload.path);
-                    break;
-                case "LIST_DIR":
-                    result = [];
-                    for (const dirItem of ffmpegCore.FS.readdir(payload.path)) {
-                        const itemStat = ffmpegCore.FS.stat(payload.path + "/" + dirItem);
-                        const isDir = ffmpegCore.FS.isDir(itemStat.mode);
-                        result.push({ name: dirItem, isDir: isDir });
-                    }
-                    break;
-                case "DELETE_DIR":
-                    ffmpegCore.FS.rmdir(payload.path);
-                    break;
-                case "MOUNT":
-                    ffmpegCore.FS.mount(ffmpegCore.FS.filesystems[payload.fsType], payload.options, payload.mountPoint);
-                    break;
-                case "UNMOUNT":
-                    ffmpegCore.FS.unmount(payload.mountPoint);
-                    break;
-                default:
-                    throw new Error("Unkown message type: " + cmd + " (msgId=" + msgId + ")");
-            }
-        } catch (err) {
-            self.postMessage([msgId, "ERROR", err.toString()]);
-            return;
-        }
+            // special args transformation for FS.mount
+            if (cmd === "FS.mount") { args = [ffmpegCore.FS.filesystems[args[0]], args[1], args[2]]; }
 
-        const transferObjs = result instanceof Uint8Array ? [result.buffer] : [];
-        self.postMessage([msgId, cmd, result], transferObjs);
+            // call core ffmpeg API with the desired command
+            if (cmd === "LOAD") { // initial ffmpeg script+wasm loading
+                const [coreURL, wasmURL, workerURL] = args;
+                importScripts(coreURL);
+                const coreFrag = btoa(JSON.stringify({ wasmURL: wasmURL, workerURL: workerURL}));
+                ffmpegCore = await self.createFFmpegCore({ mainScriptUrlOrBlob: coreURL + "#" + coreFrag });
+                ffmpegCore.setLogger((logData) => { self.postMessage(["LOG", logData, undefined]); });
+                ffmpegCore.setProgress((progData) => { self.postMessage(["PROGRESS", progData, undefined]); });
+                [cmd, result] = ["LOAD_COMPLETE", null];
+            }
+            // special case for returning non-function .ret value
+            else if (cmd === "ret") { result = ffmpegCore.ret; }
+            // filesystem function calls
+            else if (cmd.indexOf("FS.") === 0) { result = ffmpegCore.FS[cmd.split(".")[1]].apply(this, args); }
+            // direct function calls
+            else { result = ffmpegCore[cmd].apply(this, args); }
+
+            // return the results to the parent process
+            const transferObjs = result instanceof Uint8Array ? [result.buffer] : [];
+            self.postMessage([cmd, result, msgId], transferObjs);
+        }
+        // catch any errors and tell the parent process
+        catch (err) { self.postMessage(["ERROR", err.toString(), msgId]); }
     };
     `;
-    this.worker = new Worker(URL.createObjectURL(new Blob([workerJS], { type: "text/javascript" })));
-    this.worker.onmessage = (event) => {
-        const [msgId, cmd, result] = event.data;
+
+    // create a worker and tell it to load the ffmpeg-core script+wasm
+    let workerLoadedResolve = undefined;
+    const workerLoadedPromise = () => new Promise((resolve, reject) => { workerLoadedResolve = resolve; });
+    const workerObj = new Worker(URL.createObjectURL(new Blob([workerJS], { type: "text/javascript" })));
+    workerObj.postMessage([undefined, "LOAD", [config.coreURL, config.wasmURL, config.workerURL]]);
+
+    // the external API is a function that takes in commands, passes them to the worker, and waits for a response
+    const resolveFns = {};
+    const rejectFns = {};
+    let ffmpegCoreAPI = async (cmd, args, transferObjs) => {
+        // terminate command shuts the worker down and cancels all outstanding functions
+        if (cmd === "terminate") {
+            for (const msgId of Object.keys(rejectFns)) {
+                rejectFns[msgId](new Error("called FFmpeg.terminate()"));
+                delete resolveFns[msgId];
+                delete rejectFns[msgId];
+            }
+            workerObj.terminate();
+        }
+        // any other command gets passed to the worker
+        else {
+            return new Promise((resolve, reject) => {
+                const msgId = crypto.randomUUID();
+                workerObj.postMessage([msgId, cmd, (args || [])], (transferObjs || []));
+                resolveFns[msgId] = resolve;
+                rejectFns[msgId] = reject;
+            });
+        }
+    };
+    workerObj.onmessage = (event) => {
+        const [cmd, result, msgId] = event.data;
         switch (cmd) {
-            case "LOG": (config.onLog || ((l) => { console.log("log", l); }))(result); break;
-            case "PROGRESS": (config.onProgress || ((p) => { console.log("progress", p); }))(result); break;
-            case "ERROR": this._rejectFns[msgId](result); break;
-            default: this._resolveFns[msgId](result);
+            case "LOAD_COMPLETE": workerLoadedResolve(ffmpegCoreAPI); break;
+            case "LOG": config.onLog(result); break;
+            case "PROGRESS": config.onProgress(result); break;
+            case "ERROR": rejectFns[msgId](result); break;
+            default: resolveFns[msgId](result);
         }
-        delete this._resolveFns[msgId];
-        delete this._rejectFns[msgId];
+        delete resolveFns[msgId];
+        delete rejectFns[msgId];
     };
-
-    this._resolveFns = {};
-    this._rejectFns = {};
-    this.cmd = (cmd, payload, transferObjs) => {
-        return new Promise((resolve, reject) => {
-            const msgId = crypto.randomUUID();
-            this.worker.postMessage([msgId, cmd, payload], (transferObjs || []));
-            this._resolveFns[msgId] = resolve;
-            this._rejectFns[msgId] = reject;
-        });
-    };
-
-    this.terminate = () => {
-        for (const msgId of Object.keys(this.rejects)) {
-            this._rejectFns[msgId](new Error("called FFmpeg.terminate()"));
-            delete this._resolveFns[msgId];
-            delete this._rejectFns[msgId];
-        }
-        this.worker.terminate();
-    };
-};
-
+    return await workerLoadedPromise();
+}

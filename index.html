@@ -23,26 +23,33 @@
     <div style="margin-top:1em;">
         Result: <span id="progress"></span> | <span id="log"></span><br>
         <hr>
-        <div id="result"></div>
+        <div id="result-download"></div>
+        <hr>
+        <div id="result-embed"></div>
         <hr>
     </div>
     <script>
         // downloaded from https://unpkg.com/browse/@ffmpeg/core@0.12.6/dist/umd/
-        const FFMPEG_CORE_URL = document.location.origin + document.location.pathname + "/ffmpeg-core/ffmpeg-core.js";
-        const FFMPEG_WASM_URL = document.location.origin + document.location.pathname + "/ffmpeg-core/ffmpeg-core.wasm";
+        const FFMPEG_CORE_URL = document.location.origin + document.location.pathname + "./ffmpeg-core/ffmpeg-core.js";
+        const FFMPEG_WASM_URL = document.location.origin + document.location.pathname + "./ffmpeg-core/ffmpeg-core.wasm";
 
         // trigger ffmpeg to process some inputs
-        let ffmpeg = undefined;
+        let ffmpegCoreAPI = undefined;
         document.querySelector('form').addEventListener('submit', async (e) => {
             e.preventDefault();
 
             // reset results
-            document.querySelector("#result").innerHTML = "";
+            document.querySelector("#result-download").innerHTML = "";
+            document.querySelector("#result-embed").innerHTML = "";
             document.querySelector("#progress").innerHTML = "";
             document.querySelector("#log").innerHTML = "";
 
             // read inputs
             const inFile = exampleVidFile || document.querySelector('#infile').files[0];
+            if (!inFile) {
+                document.querySelector("#progress").innerHTML = "<span style='color:red;'>Need to select an input file</span>";
+                return;
+            }
             const inFileName = inFile.name;
             const inFileArr = await (new Promise((rslv) => {
                 const r = new FileReader();
@@ -59,9 +66,11 @@
             execArgs = JSON.parse(execArgs);
 
             // load ffmpeg
-            if (!ffmpeg) {
+            if (!ffmpegCoreAPI) {
                 document.querySelector("#progress").textContent = "Loading ffmpeg...";
-                ffmpegConfig = {
+                ffmpegCoreAPI = await loadFFmpegCoreAPI({
+                    coreURL: FFMPEG_CORE_URL,
+                    wasmURL: FFMPEG_WASM_URL,
                     onLog: (l) => {
                         console.log("log", l);
                         document.querySelector("#log").textContent = `[${l.type}]: ${l.message}`;
@@ -70,42 +79,60 @@
                         console.log("progress", p);
                         document.querySelector("#progress").textContent = `progress=${p.progress}, time=${p.time}`;
                     },
-                }
-                ffmpeg = new FFmpegWasmBarebones(ffmpegConfig);
-                await ffmpeg.cmd("LOAD", {
-                    coreURL: FFMPEG_CORE_URL,
-                    wasmURL: FFMPEG_WASM_URL,
                 });
                 document.querySelector("#progress").textContent = "Loaded ffmpeg!";
             }
 
-            // perform the action
-            await ffmpeg.cmd("WRITE_FILE", { path: inFileName, data: inFileArr}, [inFileArr.buffer]);
-            await ffmpeg.cmd("EXEC", { args: execArgs });
-            const data = await ffmpeg.cmd("READ_FILE", { path: outFileName });
-            await ffmpeg.cmd("DELETE_FILE", { path: outFileName });
+            // write the file to the "file system" (the wasm's virtual file system)
+            await ffmpegCoreAPI("FS.writeFile", [inFileName, inFileArr], [inFileArr.buffer]);
 
-            // render result
+            // debug dump of the virtual file system
+            const dirContents = await ffmpegCoreAPI("FS.readdir", ["/"]);
+            console.log("FS.readdir: ", dirContents);
+            for (const dirItem of dirContents) {
+                const itemStat = await ffmpegCoreAPI("FS.stat", ["/" + dirItem]);
+                const isDir = await ffmpegCoreAPI("FS.isDir", [itemStat.mode]);
+                console.log("FS.readdir: ", dirItem, itemStat, isDir);
+            }
+
+            // set ffmpeg's timeout to be unlimited
+            await ffmpegCoreAPI("setTimeout", [-1]);
+
+            // run the ffmpeg command
+            await ffmpegCoreAPI("exec", execArgs);
+            const execReturnCode = await ffmpegCoreAPI("ret");
+            document.querySelector("#log").textContent = `Final ffmpeg return code: ${execReturnCode} (0 means success)`;
+
+            // tell the ffmpeg wasm to reset
+            await ffmpegCoreAPI("reset");
+
+            // read the output file from the "file system" (the wasm's virtual file system)
+            const data = await ffmpegCoreAPI("FS.readFile", [outFileName, { encoding: "binary" }]);
+
+            // delete the file to clear up memory since it's no longer needed
+            await ffmpegCoreAPI("FS.unlink", [outFileName]);
+
+            // create a blob url for embedding on the page
             const dataUrl = URL.createObjectURL(new Blob([data.buffer], { type: outFileType }));
 
+            // create a download link for the blob url
             const dl = document.createElement("a");
             dl.href = dataUrl;
             dl.textContent = "[download]";
             dl.download = outFileName;
-            document.querySelector("#result").appendChild(dl);
+            document.querySelector("#result-download").appendChild(dl);
 
-            document.querySelector("#result").appendChild(document.createElement("br"));
-
+            // embed the result in the page so users can view it
             if (outFileType === "image/gif") {
                 const img = document.createElement("img");
                 img.src = dataUrl;
-                document.querySelector("#result").appendChild(img);
+                document.querySelector("#result-embed").appendChild(img);
             }
             else {
                 const vid = document.createElement("video");
                 vid.src = dataUrl;
                 vid.setAttribute("controls", null);
-                document.querySelector("#result").appendChild(vid);
+                document.querySelector("#result-embed").appendChild(vid);
             }
         });
 
@@ -113,10 +140,11 @@
         let exampleVidFile = undefined;
         document.querySelector('#load-example-vid').addEventListener('click', async (e) => {
             e.preventDefault();
-            document.querySelector('#load-example-vid').textContent = "loading Big_Buck_Bunny_180_10s.webm...";
-            const fileBlob = await (await fetch("Big_Buck_Bunny_180_10s.webm")).blob();
-            exampleVidFile = new File([fileBlob], "Big_Buck_Bunny_180_10s.webm");
-            document.querySelector('#load-example-vid').textContent = "loaded Big_Buck_Bunny_180_10s.webm!";
+            const sampleVid = "Big_Buck_Bunny_180_10s.webm"
+            document.querySelector('#load-example-vid').textContent = `loading ${sampleVid}...`;
+            const fileBlob = await (await fetch(sampleVid)).blob();
+            exampleVidFile = new File([fileBlob], sampleVid);
+            document.querySelector('#load-example-vid').textContent = `loaded ${sampleVid}!`;
         }, { once: true });
     </script>
   </body>
